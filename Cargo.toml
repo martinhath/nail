@@ -5,3 +5,5 @@ authors = ["Martin Hafskjold Thoresen <martinhath@gmail.com>"]
 
 [dependencies]
 image = "0.17"
+rand = "*"
+rayon = "*"
