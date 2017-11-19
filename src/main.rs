@@ -26,14 +26,18 @@ struct Triangle {
 impl Triangle {
     fn random(mut width: i32, mut height: i32) -> Self {
         const PAD: i32 = 10;
+        let hw = width / 2;
+        let hh = height / 2;
+
+
         let mut rng = rand::thread_rng();
         let a = Point {
-            x: rng.gen_range(0, width - PAD),
-            y: rng.gen_range(0, height),
+            x: rng.gen_range(-hw, width - PAD),
+            y: rng.gen_range(-hh, height + hw),
         };
         let b = Point {
-            x: rng.gen_range(a.x + PAD, width),
-            y: rng.gen_range(0, height),
+            x: rng.gen_range(a.x + PAD, width + hw),
+            y: rng.gen_range(-hh, height - PAD),
         };
         let c = Point {
             x: rng.gen_range(a.x, b.x),
@@ -94,12 +98,11 @@ fn main() {
         *p = avg_color;
     }
 
-    let _ = buffer.save(&"output.png");
     let w = w as i32;
     let h = h as i32;
 
-    const N_ITERS: usize = 200;
-    const N_TRIANGLES: usize = 50;
+    const N_ITERS: usize = 100;
+    const N_TRIANGLES: usize = 100;
 
     for iter in 0..N_TRIANGLES {
         use std::sync::Mutex;
@@ -151,6 +154,7 @@ fn main() {
         }).count();
         let mut h = best.lock().unwrap();
         buffer = h.2.take().unwrap();
+        println!("{:>3}/{}", iter, N_TRIANGLES)
     }
-    buffer.save(&"output2.png");
+    buffer.save(&format!("out-{}", filename));
 }
