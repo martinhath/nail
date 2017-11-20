@@ -7,3 +7,6 @@ authors = ["Martin Hafskjold Thoresen <martinhath@gmail.com>"]
 image = "0.17"
 rand = "*"
 rayon = "*"
+
+[profile.release]
+debug = true
