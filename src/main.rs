@@ -11,7 +11,15 @@ use image::{Pixel, ImageBuffer, Rgba};
 use rand::Rng;
 use rayon::prelude::*;
 
+
+const NUM_TRIANGLES: usize = 10;
+const TRANSPARENCY: u8 = 230;
+const N_ITERS: usize = 10_000;
+const DOWNSCALE: u32 = 64;
+
+
 type Image = ImageBuffer<Rgba<u8>, Vec<u8>>;
+type Color = [u8; 4];
 
 #[derive(Debug, Clone, Copy)]
 struct Point {
@@ -26,12 +34,27 @@ struct Triangle {
     c: Point,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct ColorTriangle {
+    triangle: Triangle,
+    color: Color,
+}
+
+impl std::ops::Deref for ColorTriangle {
+    type Target = Triangle;
+    fn deref(&self) -> &Self::Target {
+        &self.triangle
+    }
+}
+
 impl Triangle {
-    fn random(width: i32, height: i32) -> Self {
-        const PAD: i32 = 10;
+    fn random(width: u32, height: u32) -> Self {
+        const PAD: i32 = 1;
+
+        let width = width as i32;
+        let height = height as i32;
         let hw = width / 5;
         let hh = height / 5;
-
 
         let mut rng = rand::thread_rng();
         let a = Point {
@@ -59,160 +82,237 @@ impl Triangle {
         w0 >= 0 && w1 >= 0 && w2 >= 0
     }
 
-    fn bounding(&self, w: i32, h: i32) -> (i32, i32, i32, i32) {
+    fn bounding(&self, w: u32, h: u32) -> (i32, i32, i32, i32) {
         use std::cmp::{min, max};
         let min_x = min(min(self.a.x, self.b.x), self.c.x);
         let min_y = min(min(self.a.y, self.b.y), self.c.y);
-        let max_x = max(max(self.a.x, self.b.x), self.c.x);
-        let max_y = max(max(self.a.y, self.b.y), self.c.y);
-        (max(min_x, 0), max(min_y, 0), min(max_x, w), min(max_y, h))
+        let max_x = max(max(max(self.a.x, self.b.x), self.c.x), 0);
+        let max_y = max(max(max(self.a.y, self.b.y), self.c.y), 0);
+        (
+            max(min_x, 0),
+            max(min_y, 0),
+            min(max_x, w as i32),
+            min(max_y, h as i32),
+        )
     }
 }
 
-fn rmse(a: &Image, b: &Image) -> usize {
-    let mut error = 0usize;
-    for (&a, &b) in a.iter().zip(b.iter()) {
-        error += (a as i16 - b as i16).pow(2) as usize;
-    }
-    let n = a.height() * a.width();
-    error /= n as usize;
-    error
+#[derive(Debug)]
+enum Error {
+    MissingInput,
+    TriangulationFailed,
+    IoError(::std::io::Error),
+    ImageError(image::ImageError),
 }
 
-type Color = [u8; 4];
-
-fn rgba_to_color(rgba: Rgba<u8>) -> Color {
-    let c = rgba.channels();
-    [c[0], c[1], c[2], c[3]]
+struct Svg {
+    background: Color,
+    triangles: Vec<ColorTriangle>,
+    width: u32,
+    height: u32,
 }
 
-fn output_svg(filename: &AsRef<Path>, background: Color, triangles: &Vec<(Triangle, Color)>) {
-    let mut s = String::new();
-    s.push_str(&format!(
-        r##"<?xml version="1.0" standalone="no"?>
-<svg viewBox = "0 0 {} {}" version = "1.1" xmlns="http://www.w3.org/2000/svg">
-    <rect x="0" y="0" width="{0}" height="{1}" fill="{}"/>{}"##,
-        128,
-        128,
-        color_to_hex(background),
-        '\n'
-    ));
-    for &(triangle, color) in triangles {
+impl Svg {
+    fn save(&self, filename: &AsRef<Path>) -> Result<(), ::std::io::Error> {
+        fn color_to_hex(c: Color) -> String {
+            format!("#{:x}{:x}{:x}", c[0], c[1], c[2])
+        }
+
+        let mut s = String::new();
         s.push_str(&format!(
-            "    <polygon points=\"{} {}, {} {}, {} {}\" fill=\"{}\" fill-opacity=\"{}\" />\n",
-            triangle.a.x,
-            triangle.a.y,
-            triangle.b.x,
-            triangle.b.y,
-            triangle.c.x,
-            triangle.c.y,
-            color_to_hex(color),
-            color[3] as f32 / 255.0
+            r##"<?xml version="1.0" standalone="no"?>
+    <svg viewBox = "0 0 {} {}" version = "1.1" xmlns="http://www.w3.org/2000/svg">
+        <rect x="0" y="0" width="{0}" height="{1}" fill="{}"/>{}"##,
+            self.width,
+            self.height,
+            color_to_hex(self.background),
+            '\n'
         ));
+        for triangle in &self.triangles {
+            s.push_str(&format!(
+                "    <polygon points=\"{} {}, {} {}, {} {}\" fill=\"{}\" fill-opacity=\"{}\" />\n",
+                triangle.a.x,
+                triangle.a.y,
+                triangle.b.x,
+                triangle.b.y,
+                triangle.c.x,
+                triangle.c.y,
+                color_to_hex(triangle.color),
+                triangle.color[3] as f32 / 255.0
+            ));
+        }
+        s.push_str("</svg>\n");
+        let mut f = File::create(filename).unwrap();
+        f.write_all(s.as_bytes())
     }
-    s.push_str("</svg>\n");
-    let mut f = File::create(filename).unwrap();
-    f.write_all(s.as_bytes());
+
+    fn scale(&mut self, sx: f32, sy: f32) {
+        for triangle in self.triangles.iter_mut() {
+            triangle.triangle.a.x = (triangle.triangle.a.x as f32 * sx) as i32;
+            triangle.triangle.b.x = (triangle.triangle.b.x as f32 * sx) as i32;
+            triangle.triangle.c.x = (triangle.triangle.c.x as f32 * sx) as i32;
+
+            triangle.triangle.a.y = (triangle.triangle.a.y as f32 * sy) as i32;
+            triangle.triangle.b.y = (triangle.triangle.b.y as f32 * sy) as i32;
+            triangle.triangle.c.y = (triangle.triangle.c.y as f32 * sy) as i32;
+        }
+    }
 }
 
-fn color_to_hex(c: Color) -> String {
-    format!("#{:x}{:x}{:x}", c[0], c[1], c[2])
+/// Compute the next triangle for the image.
+fn next_triangle(target_image: &Image, current_image: &Image) -> Option<ColorTriangle> {
+    (0..N_ITERS)
+        .into_par_iter()
+        .flat_map(|_i| {
+            let (w, h) = target_image.dimensions();
+            let triangle = Triangle::random(w, h);
+            let (x0, y0, x1, y1) = triangle.bounding(w, h);
+
+            let cap = (y1 - y0) as usize + (x1 - x0) as usize;
+            if cap > 10_000 {
+                println!("cap={}", cap);
+                println!("{:?}", triangle.bounding(w, h));
+                println!("w={} h={}", w, h);
+                println!("triangle: {:?}", triangle);
+            }
+            let mut pixels = Vec::with_capacity(cap);
+            let mut avg_pixel = [0, 0, 0];
+            for y in y0..y1 {
+                for x in x0..x1 {
+                    if triangle.contains(Point { x, y }) {
+                        let p = target_image.get_pixel(x as u32, y as u32).channels();
+                        avg_pixel[0] += p[0] as usize;
+                        avg_pixel[1] += p[1] as usize;
+                        avg_pixel[2] += p[2] as usize;
+                        pixels.push((x as u32, y as u32));
+                    }
+                }
+            }
+            if pixels.len() == 0 {
+                return None;
+            }
+            avg_pixel[0] /= pixels.len();
+            avg_pixel[1] /= pixels.len();
+            avg_pixel[2] /= pixels.len();
+            let color = [
+                avg_pixel[0] as u8,
+                avg_pixel[1] as u8,
+                avg_pixel[2] as u8,
+                TRANSPARENCY,
+            ];
+            let score = {
+                let mut s = 0isize;
+                let c = *Rgba::from_slice(&color);
+                for &(x, y) in &pixels {
+                    let target = target_image.get_pixel(x, y);
+                    let before = *current_image.get_pixel(x, y);
+                    let old_error = {
+                        (target[0] as i16 - before[0] as i16).pow(2) as isize +
+                            (target[1] as i16 - before[1] as i16).pow(2) as isize +
+                            (target[2] as i16 - before[2] as i16).pow(2) as isize
+                    };
+                    let after = {
+                        let mut a = before;
+                        a.blend(&c);
+                        a
+                    };
+                    let new_error = {
+                        (target[0] as i16 - after[0] as i16).pow(2) as isize +
+                            (target[1] as i16 - after[1] as i16).pow(2) as isize +
+                            (target[2] as i16 - after[2] as i16).pow(2) as isize
+                    };
+                    s += new_error - old_error;
+                }
+                s // / pixels.len() as isize
+            };
+            Some((score, ColorTriangle { triangle, color }))
+        })
+        .min_by_key(|&(score, _)| score)
+        .map(|(_s, triangle)| triangle)
+}
+
+fn triangulate(image: Image) -> Result<Svg, Error> {
+    fn avg_color(img: &Image) -> Color {
+        let n = {
+            let (w, h) = img.dimensions();
+            (w * h) as usize
+        };
+        let mut c = [0; 4];
+        for (_x, _y, p) in img.enumerate_pixels() {
+            c[0] += p.data[0] as usize;
+            c[1] += p.data[1] as usize;
+            c[2] += p.data[2] as usize;
+        }
+        [(c[0] / n) as u8, (c[1] / n) as u8, (c[2] / n) as u8, 255]
+    }
+
+    fn fill_with(img: &mut Image, color: Color) {
+        let c = *Rgba::from_slice(&color);
+        for (_x, _y, p) in img.enumerate_pixels_mut() {
+            *p = c;
+        }
+    }
+
+    fn rasterize_triangle(image: &mut Image, triangle: ColorTriangle) {
+        let (w, h) = image.dimensions();
+        let (x0, y0, x1, y1) = triangle.bounding(w, h);
+
+        let color = Rgba::from_slice(&triangle.color);
+        for y in y0..y1 {
+            for x in x0..x1 {
+                if triangle.contains(Point { x, y }) {
+                    let mut p = image.get_pixel_mut(x as u32, y as u32);
+                    p.blend(color);
+                }
+            }
+        }
+    }
+
+    let (w, h) = image.dimensions();
+    let downsampled =
+        image::imageops::resize(&image, DOWNSCALE, DOWNSCALE, image::FilterType::Nearest);
+
+    let mut buffer = image.clone();
+    let background_color = avg_color(&buffer);
+    fill_with(&mut buffer, background_color);
+
+    let mut svg = Svg {
+        background: background_color,
+        triangles: vec![],
+        width: image.width(),
+        height: image.height(),
+    };
+
+    for _ in 0..NUM_TRIANGLES {
+        let triangle = next_triangle(&downsampled, &buffer).ok_or(
+            Error::TriangulationFailed,
+        )?;
+        rasterize_triangle(&mut buffer, triangle);
+        svg.triangles.push(triangle);
+    }
+
+    let scale_x = w as f32 / DOWNSCALE as f32;
+    let scale_y = h as f32 / DOWNSCALE as f32;
+    svg.scale(scale_x, scale_y);
+
+    Ok(svg)
+}
+
+fn do_stuff() -> Result<(), Error> {
+    let filename = env::args().nth(1).ok_or(Error::MissingInput)?;
+    let image: Image = image::open(&filename)
+        .map_err(|e| Error::ImageError(e))?
+        .to_rgba();
+    let triangulated = triangulate(image)?;
+    triangulated
+        .save(&format!("out-{}.svg", filename))
+        .map_err(|e| Error::IoError(e))?;
+    Ok(())
 }
 
 fn main() {
-    let filename = env::args().nth(1).expect("Usage: nail <filename>");
-    let image: Image = image::open(&filename).unwrap().to_rgba();
-    let (orig_w, orig_h) = image.dimensions();
-    let resized = image::imageops::resize(&image, 128, 128, image::FilterType::Nearest);
-
-    let avg_color = {
-        let mut b = [0usize; 3];
-        for (_x, _y, p) in resized.enumerate_pixels() {
-            b[0] += p.data[0] as usize;
-            b[1] += p.data[1] as usize;
-            b[2] += p.data[2] as usize;
-        }
-        let n = (resized.width() * resized.height()) as usize;
-        b[0] /= n;
-        b[1] /= n;
-        b[2] /= n;
-        *Rgba::from_slice(&[b[0] as u8, b[1] as u8, b[2] as u8, 255])
-    };
-    let (w, h) = resized.dimensions();
-    let mut buffer: Image = image::ImageBuffer::new(w, h);
-    for (_x, _y, p) in buffer.enumerate_pixels_mut() {
-        *p = avg_color;
+    match do_stuff() {
+        Ok(()) => {}
+        _ => unreachable!(),
     }
-
-    let w = w as i32;
-    let h = h as i32;
-
-    const N_ITERS: usize = 1_000;
-    const N_TRIANGLES: usize = 10;
-    const TRANSPARENCY: u8 = 200;
-
-    let mut triangles = Vec::new();
-
-    for iter in 0..N_TRIANGLES {
-        use std::sync::Mutex;
-        let best = Mutex::new((::std::usize::MAX, None, None));
-
-        (0..N_ITERS)
-            .into_par_iter()
-            .map(|_| {
-                let mut buffer = buffer.clone();
-                let triangle = Triangle::random(w, h);
-                let (x0, y0, x1, y1) = triangle.bounding(w, h);
-
-                let mut pixels = Vec::new();
-                let mut avg_pixel = [0, 0, 0];
-                for y in y0..y1 {
-                    for x in x0..x1 {
-                        if triangle.contains(Point { x, y }) {
-                            let p = resized.get_pixel(x as u32, y as u32).channels();
-                            avg_pixel[0] += p[0] as usize;
-                            avg_pixel[1] += p[1] as usize;
-                            avg_pixel[2] += p[2] as usize;
-                            pixels.push((x, y));
-                        }
-                    }
-                }
-                if pixels.len() == 0 {
-                    return;
-                }
-                avg_pixel[0] /= pixels.len();
-                avg_pixel[1] /= pixels.len();
-                avg_pixel[2] /= pixels.len();
-                let color = [
-                    avg_pixel[0] as u8,
-                    avg_pixel[1] as u8,
-                    avg_pixel[2] as u8,
-                    TRANSPARENCY,
-                ];
-                for &(x, y) in &pixels {
-                    let c = *Rgba::from_slice(&color);
-                    buffer.get_pixel_mut(x as u32, y as u32).blend(&c);
-                }
-
-                let score = rmse(&resized, &buffer);
-                let mut handle = best.lock().unwrap();
-                if score < handle.0 {
-                    handle.0 = score;
-                    handle.1 = Some((triangle, color));
-                    handle.2 = Some(buffer);
-                }
-            })
-            .count();
-        let mut h = best.lock().unwrap();
-        buffer = h.2.take().unwrap();
-        triangles.push(h.1.take().unwrap());
-        println!("{:>3}/{}", iter, N_TRIANGLES)
-    }
-    let resized = image::imageops::resize(&buffer, orig_w, orig_h, image::FilterType::Nearest);
-    let _ = resized.save(&format!("out-{}", filename));
-    output_svg(
-        &format!("out-{}.svg", filename),
-        rgba_to_color(avg_color),
-        &triangles,
-    );
 }
